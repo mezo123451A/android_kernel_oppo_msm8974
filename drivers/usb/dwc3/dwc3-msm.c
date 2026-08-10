@@ -1904,6 +1904,7 @@ static void dwc3_start_chg_det(struct dwc3_charger *charger, bool start)
 
 static int dwc3_msm_suspend(struct dwc3_msm *mdwc)
 {
+	struct dwc3 *dwc = platform_get_drvdata(mdwc->dwc3);
 	int ret;
 	bool dcp;
 	bool host_bus_suspend;
@@ -1916,6 +1917,20 @@ static int dwc3_msm_suspend(struct dwc3_msm *mdwc)
 	if (atomic_read(&mdwc->in_lpm)) {
 		dev_dbg(mdwc->dev, "%s: Already suspended\n", __func__);
 		return 0;
+	}
+
+	/*
+	 * The legacy MSM8974 DWC3 path cannot reliably restore a configured
+	 * FunctionFS gadget after controller power collapse. Keep the controller
+	 * active while a PC has configured the gadget; unplugged and charging-only
+	 * states still use the normal low-power path.
+	 */
+	if (!mdwc->host_mode && dwc &&
+	    dwc->dev_state == DWC3_CONFIGURED_STATE) {
+		dev_dbg(mdwc->dev,
+			 "%s: keep configured gadget out of low power mode\n",
+			 __func__);
+		return -EBUSY;
 	}
 
 	host_ss_active = dwc3_msm_read_reg(mdwc->base, USB3_PORTSC) & PORT_PE;

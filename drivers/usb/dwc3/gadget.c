@@ -2774,9 +2774,26 @@ static void dwc3_gadget_linksts_change_interrupt(struct dwc3 *dwc,
 	if (next == DWC3_LINK_STATE_U0) {
 		if (dwc->link_state == DWC3_LINK_STATE_U3) {
 			dbg_event(0xFF, "RESUME", 0);
-			dwc->gadget_driver->resume(&dwc->gadget);
+			/* Resume callbacks may queue endpoint work and take this lock. */
+			dwc->link_state = next;
+			spin_unlock(&dwc->lock);
+			if (dwc->gadget_driver && dwc->gadget_driver->resume)
+				dwc->gadget_driver->resume(&dwc->gadget);
+			spin_lock(&dwc->lock);
 		}
 	} else if (next == DWC3_LINK_STATE_U3) {
+		/*
+		 * The controller can report a suspend event while the gadget is
+		 * still being enumerated. Entering low power from that transient
+		 * state leaves the legacy MSM8974 FunctionFS endpoints unusable.
+		 */
+		if (dwc->dev_state != DWC3_CONFIGURED_STATE) {
+			dev_dbg(dwc->dev,
+					"ignore suspend before gadget is configured (state %d)\n",
+					dwc->dev_state);
+			return;
+		}
+
 		dbg_event(0xFF, "SUSPEND", 0);
 		/*
 		 * gadget_driver suspend function might require some dwc3-gadget
@@ -2784,7 +2801,8 @@ static void dwc3_gadget_linksts_change_interrupt(struct dwc3 *dwc,
 		 * released.
 		 */
 		spin_unlock(&dwc->lock);
-		dwc->gadget_driver->suspend(&dwc->gadget);
+		if (dwc->gadget_driver && dwc->gadget_driver->suspend)
+			dwc->gadget_driver->suspend(&dwc->gadget);
 		spin_lock(&dwc->lock);
 	}
 

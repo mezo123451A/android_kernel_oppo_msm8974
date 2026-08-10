@@ -311,6 +311,14 @@ struct ffs_ep {
 	int				status;	/* P: epfile->mutex */
 };
 
+struct ffs_buffer {
+	size_t				length;
+	char				*data;
+	char				storage[];
+};
+
+#define READ_BUFFER_DROP ((struct ffs_buffer *)ERR_PTR(-ESHUTDOWN))
+
 struct ffs_epfile {
 	/* Protects ep->ep and ep->req. */
 	struct mutex			mutex;
@@ -321,6 +329,9 @@ struct ffs_epfile {
 	struct ffs_ep			*ep;	/* P: ffs->eps_lock */
 
 	struct dentry			*dentry;
+
+	/* Tail of an aligned OUT request that did not fit the userspace read. */
+	struct ffs_buffer		*read_buffer;
 
 	char				name[5];
 
@@ -756,6 +767,76 @@ static void ffs_epfile_io_complete(struct usb_ep *_ep, struct usb_request *req)
 	}
 }
 
+static void __ffs_epfile_read_buffer_free(struct ffs_epfile *epfile)
+{
+	struct ffs_buffer *buf;
+
+	buf = xchg(&epfile->read_buffer, READ_BUFFER_DROP);
+	if (buf && buf != READ_BUFFER_DROP)
+		kfree(buf);
+}
+
+/* Assumes epfile->mutex is held. */
+static ssize_t __ffs_epfile_read_buffered(struct ffs_epfile *epfile,
+					  char __user *data, size_t len)
+{
+	struct ffs_buffer *buf;
+	size_t copy_len;
+	ssize_t ret;
+
+	buf = xchg(&epfile->read_buffer, NULL);
+	if (!buf || buf == READ_BUFFER_DROP)
+		return 0;
+
+	copy_len = min(len, buf->length);
+	if (unlikely(copy_to_user(data, buf->data, copy_len))) {
+		ret = -EFAULT;
+	} else {
+		ret = copy_len;
+		buf->length -= copy_len;
+		buf->data += copy_len;
+		if (!buf->length) {
+			kfree(buf);
+			return ret;
+		}
+	}
+
+	if (cmpxchg(&epfile->read_buffer, NULL, buf))
+		kfree(buf);
+
+	return ret;
+}
+
+/* Assumes epfile->mutex is held. */
+static ssize_t __ffs_epfile_read_data(struct ffs_epfile *epfile,
+				      char __user *user_data, size_t user_len,
+				      const char *data, size_t data_len)
+{
+	struct ffs_buffer *buf = NULL;
+	size_t copy_len = min(user_len, data_len);
+	size_t tail_len = data_len - copy_len;
+
+	if (tail_len) {
+		buf = kmalloc(sizeof(*buf) + tail_len, GFP_KERNEL);
+		if (!buf)
+			return -ENOMEM;
+
+		buf->length = tail_len;
+		buf->data = buf->storage;
+		memcpy(buf->storage, data + copy_len, tail_len);
+	}
+
+	if (unlikely(copy_to_user(user_data, data, copy_len))) {
+		kfree(buf);
+		return -EFAULT;
+	}
+
+	if (buf && cmpxchg(&epfile->read_buffer, NULL, buf))
+		kfree(buf);
+
+	return copy_len;
+}
+
 static ssize_t ffs_epfile_io(struct file *file,
 			     char __user *buf, size_t len, int read)
 {
@@ -840,6 +921,14 @@ first_try:
 		if (unlikely(ret))
 			goto error;
 
+		if (read) {
+			ret = __ffs_epfile_read_buffered(epfile, buf, len);
+			if (ret) {
+				mutex_unlock(&epfile->mutex);
+				goto error;
+			}
+		}
+
 		/*
 		 * We're called from user space, we can use _irq rather then
 		 * _irqsave
@@ -901,12 +990,9 @@ first_try:
 			else
 				ret = -ENODEV;
 			spin_unlock_irq(&epfile->ffs->eps_lock);
-			if (read && ret > 0) {
-				if (ret > len)
-					ret = -EOVERFLOW;
-				else if (unlikely(copy_to_user(buf, data, ret)))
-					ret = -EFAULT;
-			}
+			if (read && ret > 0)
+				ret = __ffs_epfile_read_data(epfile, buf, len,
+							     data, ret);
 		}
 	}
 
@@ -945,6 +1031,7 @@ ffs_epfile_open(struct inode *inode, struct file *file)
 
 	file->private_data = epfile;
 	ffs_data_opened(epfile->ffs);
+	(void)cmpxchg(&epfile->read_buffer, READ_BUFFER_DROP, NULL);
 	atomic_set(&epfile->error, 0);
 
 	return 0;
@@ -958,6 +1045,7 @@ ffs_epfile_release(struct inode *inode, struct file *file)
 	ENTER();
 
 	atomic_set(&epfile->error, 1);
+	__ffs_epfile_read_buffer_free(epfile);
 	ffs_data_closed(epfile->ffs);
 	file->private_data = NULL;
 
@@ -1533,6 +1621,7 @@ static void ffs_epfiles_destroy(struct ffs_epfile *epfiles, unsigned count)
 	for (; count; --count, ++epfile) {
 		BUG_ON(mutex_is_locked(&epfile->mutex) ||
 		       waitqueue_active(&epfile->wait));
+		__ffs_epfile_read_buffer_free(epfile);
 		if (epfile->dentry) {
 			d_delete(epfile->dentry);
 			dput(epfile->dentry);
@@ -1620,6 +1709,7 @@ static void ffs_func_eps_disable(struct ffs_function *func)
 	spin_lock_irqsave(&func->ffs->eps_lock, flags);
 	do {
 		atomic_set(&epfile->error, 1);
+		__ffs_epfile_read_buffer_free(epfile);
 		/* pending requests get nuked */
 		if (likely(ep->ep)) {
 			usb_ep_disable(ep->ep);
