@@ -4073,6 +4073,15 @@ exit:
 	return error;
 }
 
+SYSCALL_DEFINE5(renameat2, int, olddfd, const char __user *, oldname,
+		int, newdfd, const char __user *, newname, unsigned int, flags)
+{
+	/* Bionic uses renameat2 with zero flags for ordinary renames. */
+	if (flags)
+		return -EINVAL;
+	return sys_renameat(olddfd, oldname, newdfd, newname);
+}
+
 SYSCALL_DEFINE2(rename, const char __user *, oldname, const char __user *, newname)
 {
 	return sys_renameat(AT_FDCWD, oldname, AT_FDCWD, newname);

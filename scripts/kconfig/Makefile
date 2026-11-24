@@ -76,7 +76,10 @@ PHONY += allnoconfig allyesconfig allmodconfig alldefconfig randconfig
 allnoconfig allyesconfig allmodconfig alldefconfig randconfig: $(obj)/conf
 	$< --$@ $(Kconfig)
 
-PHONY += listnewconfig oldnoconfig savedefconfig defconfig
+PHONY += listnewconfig oldnoconfig olddefconfig savedefconfig defconfig
+
+# This Kconfig version calls the default-preserving target oldnoconfig.
+olddefconfig: oldnoconfig
 
 listnewconfig oldnoconfig: $(obj)/conf
 	$< --$@ $(Kconfig)
